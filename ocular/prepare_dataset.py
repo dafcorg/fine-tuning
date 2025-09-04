@@ -1,6 +1,7 @@
 """
 pip install kaggle
 kaggle datasets download -d andrewmvd/ocular-disease-recognition-odir5k
+kaggle datasets download andrewmvd/ocular-disease-recognition-odir5k
 unzip ocular-disease-recognition-odir5k.zip -d data/ODIR-5K
 
 python prepare_dataset.py

@@ -1,5 +1,10 @@
 """
 pip install kaggle
+
+mkdir -p ~/.kaggle
+mv kaggle.json ~/.kaggle/
+chmod 600 ~/.kaggle/kaggle.json
+
 kaggle datasets download -d andrewmvd/ocular-disease-recognition-odir5k
 kaggle datasets download andrewmvd/ocular-disease-recognition-odir5k
 unzip ocular-disease-recognition-odir5k.zip -d data/ODIR-5K

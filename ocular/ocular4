@@ -1,0 +1,247 @@
+"""
+ocular_finetune_strong.py
+-----------------------------------
+Fine-Tuning con técnicas anti-overfitting en dataset ocular ya preparado.
+
+Incluye:
+- WeightedRandomSampler (--balanced)
+- Early Stopping (--patience)
+- ReduceLROnPlateau (default) o CosineAnnealingLR (--cosine)
+- Weight Decay (--weight_decay)
+- Label Smoothing (--label_smoothing)
+- Focal Loss (--focal)
+- Optimizer SGD o Adam (--opt)
+- Freeze BatchNorm (--freeze_bn)
+- Data augmentation reforzada
+- FLOPs y power logging
+"""
+
+import os, time, json, random, numpy as np, subprocess
+import matplotlib.pyplot as plt, seaborn as sns, pandas as pd
+import torch, torch.nn as nn, torch.optim as optim
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from torchvision import datasets, models, transforms
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
+from ptflops import get_model_complexity_info
+from collections import Counter
+import argparse
+
+# ==============================
+# 1. Argumentos
+# ==============================
+parser = argparse.ArgumentParser()
+
+parser.add_argument("--model", type=str, default="resnet50",
+    choices=["resnet50","mobilenet_v2","densenet121","inception_v3"])
+parser.add_argument("--epochs", type=int, default=50)
+parser.add_argument("--batch_size", type=int, default=32)
+parser.add_argument("--lr", type=float, default=1e-4)
+parser.add_argument("--weight_decay", type=float, default=1e-4)
+parser.add_argument("--device", type=str, default="cuda:0")
+parser.add_argument("--data_dir", type=str, default="data/ODIR-5K")
+parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--balanced", action="store_true")
+parser.add_argument("--focal", action="store_true")
+parser.add_argument("--label_smoothing", type=float, default=0.1)
+parser.add_argument("--opt", type=str, default="adam", choices=["adam","sgd"])
+parser.add_argument("--freeze_bn", action="store_true")
+parser.add_argument("--patience", type=int, default=7)
+parser.add_argument("--cosine", action="store_true", help="usar CosineAnnealingLR")
+
+args = parser.parse_args()
+
+# ==============================
+# 2. Semilla reproducibilidad
+# ==============================
+def set_seed(seed=42):
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+set_seed(args.seed)
+
+DEVICE = torch.device(args.device if torch.cuda.is_available() else "cpu")
+
+print("\n===== Configuración Experimento =====")
+for k,v in vars(args).items(): print(f"{k}: {v}")
+print("=====================================\n")
+
+# ==============================
+# 3. Augmentaciones
+# ==============================
+input_size = 224 if args.model != "inception_v3" else 299
+data_transforms = {
+    "train": transforms.Compose([
+        transforms.RandomResizedCrop(input_size, scale=(0.8,1.0)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(25),
+        transforms.ColorJitter(0.3,0.3,0.3),
+        transforms.GaussianBlur(3),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+    ]),
+    "val": transforms.Compose([
+        transforms.Resize((input_size,input_size)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+    ]),
+}
+
+# ==============================
+# 4. Dataset y Sampler
+# ==============================
+image_datasets = {x: datasets.ImageFolder(os.path.join(args.data_dir,x),data_transforms[x]) for x in ["train","val"]}
+if args.balanced:
+    targets = [y for _,y in image_datasets["train"]]
+    counts = Counter(targets); weights = 1./torch.tensor(list(counts.values()),dtype=torch.float)
+    samples_w = [weights[t] for t in targets]
+    sampler = WeightedRandomSampler(samples_w,num_samples=len(samples_w),replacement=True)
+    train_loader = DataLoader(image_datasets["train"],batch_size=args.batch_size,sampler=sampler,num_workers=4)
+else:
+    train_loader = DataLoader(image_datasets["train"],batch_size=args.batch_size,shuffle=True,num_workers=4)
+val_loader = DataLoader(image_datasets["val"],batch_size=args.batch_size,shuffle=False,num_workers=4)
+dataloaders={"train":train_loader,"val":val_loader}
+class_names=image_datasets["train"].classes; num_classes=len(class_names)
+
+# ==============================
+# 5. Modelo base
+# ==============================
+def initialize_model(name,num_classes,pretrained=True):
+    if name=="resnet50":
+        m=models.resnet50(pretrained=pretrained)
+        m.fc=nn.Linear(m.fc.in_features,num_classes)
+    elif name=="mobilenet_v2":
+        m=models.mobilenet_v2(pretrained=pretrained)
+        m.classifier[1]=nn.Linear(m.last_channel,num_classes)
+    elif name=="densenet121":
+        m=models.densenet121(pretrained=pretrained)
+        m.classifier=nn.Linear(m.classifier.in_features,num_classes)
+    elif name=="inception_v3":
+        m=models.inception_v3(pretrained=pretrained)
+        m.fc=nn.Linear(m.fc.in_features,num_classes)
+    return m
+
+model=initialize_model(args.model,num_classes).to(DEVICE)
+
+# congelar todo y liberar últimos bloques
+for p in model.parameters(): p.requires_grad=False
+if args.model=="resnet50":
+    for n,p in model.named_parameters():
+        if "layer3" in n or "layer4" in n or "fc" in n: p.requires_grad=True
+
+# congelar BN si se pide
+def freeze_bn_stats(m):
+    if isinstance(m,nn.BatchNorm2d):
+        m.eval(); [setattr(p,"requires_grad",False) for p in m.parameters()]
+if args.freeze_bn: model.apply(freeze_bn_stats)
+
+# ==============================
+# 6. Loss
+# ==============================
+class FocalLoss(nn.Module):
+    def __init__(self,alpha=1,gamma=2,reduction="mean"):
+        super().__init__(); self.alpha=alpha; self.gamma=gamma; self.reduction=reduction
+    def forward(self,inputs,targets):
+        ce=nn.CrossEntropyLoss(reduction="none")(inputs,targets)
+        pt=torch.exp(-ce); loss=self.alpha*((1-pt)**self.gamma)*ce
+        return loss.mean() if self.reduction=="mean" else loss.sum()
+
+criterion = FocalLoss() if args.focal else nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+
+# ==============================
+# 7. Optimizador y Scheduler
+# ==============================
+params_upd=[p for p in model.parameters() if p.requires_grad]
+if args.opt=="sgd":
+    optimizer=optim.SGD(params_upd,lr=args.lr,momentum=0.9,weight_decay=args.weight_decay,nesterov=True)
+else:
+    optimizer=optim.Adam(params_upd,lr=args.lr,weight_decay=args.weight_decay)
+
+if args.cosine:
+    scheduler=optim.lr_scheduler.CosineAnnealingLR(optimizer,T_max=args.epochs,eta_min=args.lr*0.01)
+else:
+    scheduler=optim.lr_scheduler.ReduceLROnPlateau(optimizer,mode="max",patience=3,factor=0.1)
+
+# ==============================
+# 8. FLOPs
+# ==============================
+with torch.cuda.device(0):
+    macs,params=get_model_complexity_info(model,(3,input_size,input_size),
+                                          as_strings=True,print_per_layer_stat=False,verbose=False)
+print(f"🔹 FLOPs: {macs}, Params: {params}")
+
+# ==============================
+# 9. Entrenamiento
+# ==============================
+def train_model(model,dls,criterion,optimizer,scheduler,num_epochs=args.epochs,patience=args.patience):
+    power_log=open(f"power_train_{args.model}.csv","w")
+    power_proc=subprocess.Popen(["nvidia-smi","--loop=1",
+        "--query-gpu=timestamp,power.draw","--format=csv"],stdout=power_log)
+
+    best_acc,no_improve=0.0,0; history={"train_loss":[],"val_loss":[],"val_acc":[]}
+    start=time.time()
+
+    for epoch in range(num_epochs):
+        print(f"Epoch {epoch+1}/{num_epochs}")
+        for phase in ["train","val"]:
+            model.train() if phase=="train" else model.eval()
+            run_loss,y_true,y_pred=0.0,[],[]
+            for inputs,labels in dls[phase]:
+                inputs,labels=inputs.to(DEVICE),labels.to(DEVICE)
+                optimizer.zero_grad()
+                with torch.set_grad_enabled(phase=="train"):
+                    outputs=model(inputs)
+                    loss=criterion(outputs,labels)
+                    _,preds=torch.max(outputs,1)
+                    if phase=="train":
+                        loss.backward(); optimizer.step()
+                run_loss+=loss.item()*inputs.size(0)
+                y_true.extend(labels.cpu().numpy()); y_pred.extend(preds.cpu().numpy())
+            ep_loss=run_loss/len(dls[phase].dataset)
+            acc=accuracy_score(y_true,y_pred); f1=f1_score(y_true,y_pred,average="macro")
+            print(f"{phase} Loss:{ep_loss:.4f} Acc:{acc:.4f} F1:{f1:.4f}")
+            if phase=="train": history["train_loss"].append(ep_loss)
+            else:
+                history["val_loss"].append(ep_loss); history["val_acc"].append(acc)
+                if args.cosine: scheduler.step()
+                else: scheduler.step(acc)
+                if acc>best_acc:
+                    best_acc,no_improve=acc,0
+                    torch.save(model.state_dict(),f"best_{args.model}_strong.pth")
+                else:
+                    no_improve+=1
+                    if no_improve>=patience:
+                        print("⏹️ Early stopping"); 
+                        total=time.time()-start
+                        power_proc.terminate(); power_log.close()
+                        return model,history,total,y_true,y_pred
+    total=time.time()-start
+    power_proc.terminate(); power_log.close()
+    return model,history,total,y_true,y_pred
+
+trained,hist,train_time,y_true,y_pred=train_model(model,dataloaders,criterion,optimizer,scheduler)
+
+# ==============================
+# 10. Guardar resultados
+# ==============================
+results={**vars(args),"train_time_sec":train_time,"FLOPs":macs,"params":params,"mode":"Fine-Tuning Strong"}
+with open(f"results_{args.model}_strong.txt","w") as f: [f.write(f"{k}: {v}\n") for k,v in results.items()]
+with open(f"metadata_{args.model}_strong.json","w") as f: json.dump(results,f,indent=4)
+
+# ==============================
+# 11. Curvas y Confusion Matrix
+# ==============================
+plt.figure(); plt.plot(hist["train_loss"],label="Train Loss"); plt.plot(hist["val_loss"],label="Val Loss")
+plt.legend(); plt.title("Loss"); plt.savefig(f"loss_curve_{args.model}_strong.png")
+
+plt.figure(); plt.plot(hist["val_acc"],label="Val Acc"); plt.legend(); plt.title("Accuracy")
+plt.savefig(f"acc_curve_{args.model}_strong.png")
+
+cm=confusion_matrix(y_true,y_pred)
+plt.figure(figsize=(8,6))
+sns.heatmap(cm,annot=True,fmt="d",cmap="Blues",xticklabels=class_names,yticklabels=class_names)
+plt.ylabel("True"); plt.xlabel("Pred"); plt.title("Confusion Matrix")
+plt.savefig(f"cm_{args.model}_strong.png")
+pd.DataFrame(cm,index=class_names,columns=class_names).to_csv(f"cm_{args.model}_strong.csv")
+
+print("✅ Fine-Tuning Strong completado y guardado")

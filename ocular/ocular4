@@ -14,6 +14,36 @@ Incluye:
 - Freeze BatchNorm (--freeze_bn)
 - Data augmentation reforzada
 - FLOPs y power logging
+
+# 1. SGD + CrossEntropy + LabelSmoothing + FreezeBN + CosineAnnealing
+python ocular_finetune_strong.py --model resnet50 --opt sgd --lr 3e-4 \
+  --weight_decay 1e-4 --label_smoothing 0.1 --freeze_bn --cosine --balanced
+
+# 2. SGD + FocalLoss + FreezeBN + CosineAnnealing
+python ocular_finetune_strong.py --model resnet50 --opt sgd --lr 3e-4 \
+  --weight_decay 1e-4 --focal --freeze_bn --cosine --balanced
+
+# 3. SGD + CrossEntropy + LabelSmoothing + (BN entrenable) + CosineAnnealing
+python ocular_finetune_strong.py --model resnet50 --opt sgd --lr 3e-4 \
+  --weight_decay 1e-4 --label_smoothing 0.1 --cosine --balanced
+
+# 4. Adam + FocalLoss + FreezeBN + ReduceLROnPlateau
+python ocular_finetune_strong.py --model resnet50 --opt adam --lr 1e-4 \
+  --weight_decay 1e-4 --focal --freeze_bn --balanced
+
+# 5. Adam + CrossEntropy + LabelSmoothing + (BN entrenable) + ReduceLROnPlateau
+python ocular_finetune_strong.py --model resnet50 --opt adam --lr 1e-4 \
+  --weight_decay 1e-4 --label_smoothing 0.1 --balanced
+
+# 6. SGD + CrossEntropy (sin LS) + (BN entrenable) + StepLR (≈ ReduceLR por defecto sin --cosine)
+python ocular_finetune_strong.py --model resnet50 --opt sgd --lr 3e-4 \
+  --weight_decay 1e-4 --balanced
+
+# 7. Adam + CrossEntropy (baseline actual)
+python ocular_finetune_strong.py --model resnet50 --opt adam --lr 1e-4 \
+  --weight_decay 1e-4 --balanced
+
+
 """
 
 import os, time, json, random, numpy as np, subprocess
